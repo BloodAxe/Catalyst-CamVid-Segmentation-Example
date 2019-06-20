@@ -250,7 +250,7 @@ def main():
     runner.train(
         model=model,
         criterion=nn.CrossEntropyLoss(),
-        optimizer=Adam(model.parameters(), lr=1e-3),
+        optimizer=optimizer,
         scheduler=scheduler,
         callbacks=[
             MulticlassIoUCallback(prefix='iou'),
