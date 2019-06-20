@@ -103,7 +103,7 @@ class LinkNet34(nn.Module):
 
 
 class LinkNet152(nn.Module):
-    def __init__(self, num_classes=1, num_channels=3, pretrained=True, dropout=0.1):
+    def __init__(self, num_classes=1, num_channels=3, pretrained=True, dropout=0.5):
         super().__init__()
         assert num_channels == 3
         self.num_classes = num_classes
@@ -128,8 +128,10 @@ class LinkNet152(nn.Module):
         # Final Classifier
         self.finaldropout = nn.Dropout2d(dropout)
         self.finaldeconv1 = nn.ConvTranspose2d(filters[0], 128, 3, stride=2)
+        self.finalbn1 = nn.BatchNorm2d(128)
         self.finalrelu1 = nn.ReLU(inplace=True)
         self.finalconv2 = nn.Conv2d(128, 64, 3)
+        self.finalbn2 = nn.BatchNorm2d(64)
         self.finalrelu2 = nn.ReLU(inplace=True)
         self.finalconv3 = nn.Conv2d(64, num_classes, 2, padding=1)
 
@@ -155,9 +157,13 @@ class LinkNet152(nn.Module):
 
         # Final Classification
         f1 = self.finaldeconv1(d1)
+        f1 = self.finalbn1(f1)
         f2 = self.finalrelu1(f1)
+
         f3 = self.finalconv2(f2)
+        f3 = self.finalbn2(f3)
         f4 = self.finalrelu2(f3)
+
         f5 = self.finalconv3(f4)
 
         f5 = unpad_image_tensor(f5, pad)

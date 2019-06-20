@@ -16,7 +16,7 @@ from pytorch_toolbelt.utils.torch_utils import tensor_from_rgb_image, to_numpy, 
 from torch.optim import Adam
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
-from models.linknet import LinkNet34
+from models.linknet import LinkNet152
 
 CLASSES = ['sky', 'building', 'pole', 'road', 'pavement',
            'tree', 'signsymbol', 'fence', 'car',
@@ -89,6 +89,13 @@ def get_training_augmentation():
             A.IAASharpen(),
             A.Blur(blur_limit=3),
             A.MotionBlur(blur_limit=3),
+            A.NoOp()
+        ]),
+        A.OneOf([
+            A.RandomFog(),
+            A.RandomSunFlare(),
+            A.RandomRain(),
+            A.RandomSnow(),
             A.NoOp()
         ]),
         A.Normalize(),
@@ -205,7 +212,7 @@ def main():
     data_loaders = OrderedDict()
     num_train_samples = len(train_ds)
     mul_factor = 10
-    batch_size = 32 * torch.cuda.device_count()
+    batch_size = 8 * torch.cuda.device_count()
     data_loaders['train'] = DataLoader(train_ds,
                                        batch_size=batch_size,
                                        shuffle=False,
@@ -229,7 +236,7 @@ def main():
     print(len(train_ds), len(valid_ds))
 
     num_classes = len(CLASSES)
-    model = LinkNet34(num_classes, dropout=0.1).cuda()
+    model = LinkNet152(num_classes, dropout=0.5).cuda()
 
     # model runner
     runner = SupervisedRunner()
@@ -249,7 +256,7 @@ def main():
             MulticlassIoUCallback(prefix='iou'),
             ShowPolarBatchesCallback(visualize_predictions, metric='iou', minimize=True),
         ],
-        logdir='runs',
+        logdir='runs/linknet152',
         loaders=data_loaders,
         num_epochs=150,
         verbose=True,
