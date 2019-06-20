@@ -14,7 +14,7 @@ from pytorch_toolbelt.utils.fs import id_from_fname
 from pytorch_toolbelt.utils.torch_utils import tensor_from_rgb_image, to_numpy, \
     rgb_image_from_tensor
 from torch.optim import Adam
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 from models.linknet import LinkNet34
 
@@ -204,10 +204,15 @@ def main():
                              transform=get_validation_augmentation())
 
     data_loaders = OrderedDict()
-    data_loaders['train'] = DataLoader(train_ds, batch_size=32, shuffle=True,
-                                       num_workers=16, pin_memory=True)
+    num_train_samples = len(train_ds)
+    mul_factor = 10
+
+    data_loaders['train'] = DataLoader(train_ds, batch_size=32, shuffle=False,
+                                       num_workers=16, pin_memory=True,
+                                       sampler=WeightedRandomSampler(np.ones(num_train_samples), num_train_samples * mul_factor))
+
     data_loaders['valid'] = DataLoader(valid_ds, batch_size=32, shuffle=False,
-                                       num_workers=8, pin_memory=True)
+                                       num_workers=4, pin_memory=True)
 
     print(len(train_ds), len(valid_ds))
 
@@ -219,8 +224,7 @@ def main():
 
     optimizer = Adam(model.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-                                                     milestones=[30, 60, 90,
-                                                                 120],
+                                                     milestones=[30, 60, 90, 120],
                                                      gamma=0.5)
 
     # model training
