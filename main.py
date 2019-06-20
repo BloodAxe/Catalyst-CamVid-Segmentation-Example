@@ -74,42 +74,29 @@ class CamVidDataset(Dataset):
 
 def get_training_augmentation():
     train_transform = [
-
-        # A.ShiftScaleRotate(scale_limit=0.5, rotate_limit=5, shift_limit=0.1, p=1, border_mode=cv2.BORDER_CONSTANT),
-        # A.PadIfNeeded(min_height=320, min_width=320, always_apply=True, border_mode=cv2.BORDER_CONSTANT),
         A.RandomSizedCrop(min_max_height=(300, 360), height=320, width=320,
                           always_apply=True),
         A.HorizontalFlip(p=0.5),
-
-        A.IAAAdditiveGaussianNoise(p=0.2),
-        # A.IAAPerspective(p=0.5),
-
-        A.OneOf(
-            [
-                A.CLAHE(p=1),
-                A.RandomBrightnessContrast(p=1),
-                A.RandomGamma(p=1),
-                A.HueSaturationValue(p=1),
-                A.NoOp()
-            ]
-        ),
-
-        A.OneOf(
-            [
-                A.IAASharpen(p=1),
-                A.Blur(blur_limit=3, p=1),
-                A.MotionBlur(blur_limit=3, p=1),
-                A.NoOp()
-            ]
-        ),
-
+        A.OneOf([
+            A.CLAHE(),
+            A.RandomBrightnessContrast(),
+            A.RandomGamma(),
+            A.HueSaturationValue(),
+            A.NoOp()
+        ]),
+        A.OneOf([
+            A.IAAAdditiveGaussianNoise(p=0.2),
+            A.IAASharpen(),
+            A.Blur(blur_limit=3),
+            A.MotionBlur(blur_limit=3),
+            A.NoOp()
+        ]),
         A.Normalize(),
     ]
     return A.Compose(train_transform)
 
 
 def get_validation_augmentation():
-    """Add paddings to make image shape divisible by 32"""
     test_transform = [
         A.Normalize(),
     ]
@@ -129,12 +116,11 @@ def visualize_predictions(input: dict, output: dict,
         logits = to_numpy(logits).argmax(axis=0)
 
         overlay = image.copy()
-        for class_index, class_color in enumerate(range(len(COLORS))):
+        for class_index, class_color in enumerate(COLORS):
             image[logits == class_index, :] = class_color
 
         overlay = cv2.addWeighted(image, 0.5, overlay, 0.5, 0, dtype=cv2.CV_8U)
-        cv2.putText(overlay, str(image_id), (10, 15), cv2.FONT_HERSHEY_PLAIN,
-                    1, (250, 250, 250))
+        cv2.putText(overlay, str(image_id), (10, 15), cv2.FONT_HERSHEY_PLAIN, 1, (250, 250, 250))
 
         images.append(overlay)
     return images
@@ -145,8 +131,7 @@ class MulticlassIoUCallback(Callback):
     Jaccard metric callback which is computed across whole epoch, not per-batch.
     """
 
-    def __init__(self, input_key: str = "targets", output_key: str = "logits",
-                 prefix: str = "iou"):
+    def __init__(self, input_key: str = "targets", output_key: str = "logits", prefix: str = "iou"):
         """
         :param input_key: input key to use for IoU calculation; specifies our `y_true`.
         :param output_key: output key to use for IoU calculation; specifies our `y_pred`.
@@ -167,25 +152,34 @@ class MulticlassIoUCallback(Callback):
         # Binarize outputs as we don't want to compute soft-jaccard
         outputs = outputs.argmax(dim=1)
 
-        # outputs = outputs.cpu()
-        # targets = targets.cpu()
+        outputs = outputs.cpu()
+        targets = targets.cpu()
 
-        ious_per_class = []
-        for class_index in range(num_classes):
-            pred_class_mask = (outputs[:, class_index, ...] == class_index).type(dtype)
-            true_class_mask = (targets[:, class_index, ...] == class_index).type(dtype)
+        ious_per_batch = []
 
-            intersection = float(torch.sum(true_class_mask * pred_class_mask))
-            union = float(torch.sum(true_class_mask) + torch.sum(pred_class_mask))
-            true_counts = int(torch.sum(true_class_mask) > 0)
+        for batch_index in range(batch_size):
 
-            if true_counts:
-                iou = intersection / (union - intersection + self.eps)
-                ious_per_class.append(iou)
+            ious_per_class = []
+            for class_index in range(num_classes):
+                pred_class_mask = (outputs[batch_index] == class_index).float()
+                true_class_mask = (targets[batch_index] == class_index).float()
+
+                intersection = float(torch.sum(true_class_mask * pred_class_mask))
+                union = float(torch.sum(true_class_mask) + torch.sum(pred_class_mask))
+                true_counts = int(torch.sum(true_class_mask) > 0)
+
+                if true_counts:
+                    iou = intersection / (union - intersection + self.eps)
+                    ious_per_class.append(iou)
+
+            if len(ious_per_class):
+                iou_per_image = np.mean(ious_per_class)
             else:
-                ious_per_class.append(0)
+                iou_per_image = 0
 
-        metric = np.mean(ious_per_class)
+            ious_per_batch.append(iou_per_image)
+
+        metric = np.mean(ious_per_batch)
         state.metrics.add_batch_value(name=self.prefix, value=metric)
 
 
@@ -198,26 +192,44 @@ def main():
     x_valid_dir = os.path.join(DATA_DIR, 'val')
     y_valid_dir = os.path.join(DATA_DIR, 'valannot')
 
+    x_test_dir = os.path.join(DATA_DIR, 'test')
+    y_test_dir = os.path.join(DATA_DIR, 'testannot')
+
     train_ds = CamVidDataset(x_train_dir, y_train_dir,
                              transform=get_training_augmentation())
     valid_ds = CamVidDataset(x_valid_dir, y_valid_dir,
                              transform=get_validation_augmentation())
+    test_ds = CamVidDataset(x_test_dir, y_test_dir,
+                            transform=get_validation_augmentation())
 
     data_loaders = OrderedDict()
     num_train_samples = len(train_ds)
-    mul_factor = 10
+    mul_factor = 1
+    batch_size = 32 * torch.cuda.device_count()
+    data_loaders['train'] = DataLoader(train_ds,
+                                       batch_size=batch_size,
+                                       shuffle=False,
+                                       num_workers=8,
+                                       pin_memory=True,
+                                       sampler=WeightedRandomSampler(np.ones(num_train_samples),
+                                                                     num_train_samples * mul_factor))
 
-    data_loaders['train'] = DataLoader(train_ds, batch_size=32, shuffle=False,
-                                       num_workers=16, pin_memory=True,
-                                       sampler=WeightedRandomSampler(np.ones(num_train_samples), num_train_samples * mul_factor))
+    data_loaders['valid'] = DataLoader(valid_ds,
+                                       batch_size=batch_size,
+                                       shuffle=False,
+                                       num_workers=4,
+                                       pin_memory=True)
 
-    data_loaders['valid'] = DataLoader(valid_ds, batch_size=32, shuffle=False,
-                                       num_workers=4, pin_memory=True)
+    data_loaders['test'] = DataLoader(test_ds,
+                                      batch_size=batch_size,
+                                      shuffle=False,
+                                      num_workers=4,
+                                      pin_memory=True)
 
     print(len(train_ds), len(valid_ds))
 
     num_classes = len(CLASSES)
-    model = LinkNet34(num_classes).cuda()
+    model = LinkNet34(num_classes, dropout=0).cuda()
 
     # model runner
     runner = SupervisedRunner()
@@ -231,12 +243,11 @@ def main():
     runner.train(
         model=model,
         criterion=nn.CrossEntropyLoss(),
-        optimizer=Adam(model.parameters(), lr=1e-4),
+        optimizer=Adam(model.parameters(), lr=1e-3),
         scheduler=scheduler,
         callbacks=[
             MulticlassIoUCallback(prefix='iou'),
-            ShowPolarBatchesCallback(visualize_predictions, metric='loss',
-                                     minimize=True),
+            ShowPolarBatchesCallback(visualize_predictions, metric='iou', minimize=True),
         ],
         logdir='runs',
         loaders=data_loaders,

@@ -2,6 +2,8 @@ from pytorch_toolbelt.inference.functional import unpad_image_tensor, \
     pad_image_tensor
 from torch import nn
 
+from torchvision.models import resnet152, resnet34
+
 
 class DecoderBlockLinkNet(nn.Module):
     def __init__(self, in_channels, n_filters):
@@ -38,7 +40,7 @@ class DecoderBlockLinkNet(nn.Module):
 
 
 class LinkNet34(nn.Module):
-    def __init__(self, num_classes=1, num_channels=3, pretrained=True):
+    def __init__(self, num_classes=1, num_channels=3, pretrained=True, dropout=0.1):
         super().__init__()
         assert num_channels == 3
         self.num_classes = num_classes
@@ -61,7 +63,7 @@ class LinkNet34(nn.Module):
         self.decoder1 = DecoderBlockLinkNet(filters[0], filters[0])
 
         # Final Classifier
-        self.finaldropout = nn.Dropout2d(0.5)
+        self.finaldropout = nn.Dropout2d(dropout)
         self.finaldeconv1 = nn.ConvTranspose2d(filters[0], 32, 3, stride=2)
         self.finalrelu1 = nn.ReLU(inplace=True)
         self.finalconv2 = nn.Conv2d(32, 32, 3)
@@ -87,8 +89,9 @@ class LinkNet34(nn.Module):
         d2 = self.decoder2(d3) + e1
         d1 = self.decoder1(d2)
 
-        # Final Classification
         d1 = self.finaldropout(d1)
+
+        # Final Classification
         f1 = self.finaldeconv1(d1)
         f2 = self.finalrelu1(f1)
         f3 = self.finalconv2(f2)
@@ -96,15 +99,11 @@ class LinkNet34(nn.Module):
         f5 = self.finalconv3(f4)
 
         f5 = unpad_image_tensor(f5, pad)
-
         return f5
 
 
-from torchvision.models import resnet152, resnet34
-
-
 class LinkNet152(nn.Module):
-    def __init__(self, num_classes=1, num_channels=3, pretrained=True):
+    def __init__(self, num_classes=1, num_channels=3, pretrained=True, dropout=0.1):
         super().__init__()
         assert num_channels == 3
         self.num_classes = num_classes
@@ -127,15 +126,16 @@ class LinkNet152(nn.Module):
         self.decoder1 = DecoderBlockLinkNet(filters[0], filters[0])
 
         # Final Classifier
+        self.finaldropout = nn.Dropout2d(dropout)
         self.finaldeconv1 = nn.ConvTranspose2d(filters[0], 128, 3, stride=2)
         self.finalrelu1 = nn.ReLU(inplace=True)
         self.finalconv2 = nn.Conv2d(128, 64, 3)
         self.finalrelu2 = nn.ReLU(inplace=True)
-        self.finaldrop = nn.Dropout2d(0.1)
         self.finalconv3 = nn.Conv2d(64, num_classes, 2, padding=1)
 
-    # noinspection PyCallingNonCallable
     def forward(self, x):
+        x, pad = pad_image_tensor(x, 32)
+
         # Encoder
         x = self.firstconv(x)
         x = self.firstbn(x)
@@ -151,13 +151,14 @@ class LinkNet152(nn.Module):
         d3 = self.decoder3(d4) + e2
         d2 = self.decoder2(d3) + e1
         d1 = self.decoder1(d2)
+        d1 = self.finaldropout(d1)
 
         # Final Classification
         f1 = self.finaldeconv1(d1)
         f2 = self.finalrelu1(f1)
         f3 = self.finalconv2(f2)
         f4 = self.finalrelu2(f3)
-        f4 = self.finaldrop(f4)
         f5 = self.finalconv3(f4)
 
+        f5 = unpad_image_tensor(f5, pad)
         return f5
