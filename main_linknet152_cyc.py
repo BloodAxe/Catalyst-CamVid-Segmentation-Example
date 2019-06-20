@@ -243,7 +243,7 @@ def main():
 
     optimizer = Adam(model.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-                                                     milestones=[30, 60, 90, 120],
+                                                     milestones=[50, 75, 100, 125, 130, 135, 140, 145],
                                                      gamma=0.5)
 
     # model training
