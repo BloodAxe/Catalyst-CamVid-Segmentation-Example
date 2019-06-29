@@ -1,28 +1,32 @@
 import os
 from collections import OrderedDict
-
-import albumentations as A
-import cv2
+from functools import partial
 import numpy as np
+import albumentations as A
 import torch
 import torch.nn as nn
-from catalyst.dl.callbacks import IouCallback, Callback, RunnerState
-from catalyst.dl.experiments import SupervisedRunner
+from catalyst.contrib.schedulers import MultiStepLR
+from catalyst.dl import SupervisedRunner
+from catalyst.utils import unpack_checkpoint, load_checkpoint
+from pytorch_toolbelt.inference.functional import pad_image_tensor, unpad_image_tensor
+from pytorch_toolbelt.optimization.functional import get_lr_decay_parameters
+from pytorch_toolbelt.losses import JointLoss, MulticlassDiceLoss, FocalLoss
 from pytorch_toolbelt.utils import fs
-from pytorch_toolbelt.utils.catalyst_utils import ShowPolarBatchesCallback
+from pytorch_toolbelt.utils.catalyst import *
 from pytorch_toolbelt.utils.fs import id_from_fname
-from pytorch_toolbelt.utils.torch_utils import tensor_from_mask_image, tensor_from_rgb_image, to_numpy, rgb_image_from_tensor
+from pytorch_toolbelt.utils.torch_utils import tensor_from_rgb_image, set_trainable
 from torch.optim import Adam
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision.models import resnet34
+from datetime import datetime
 
-CLASSES = ['sky', 'building', 'pole', 'road', 'pavement',
-           'tree', 'signsymbol', 'fence', 'car',
-           'pedestrian', 'bicyclist', 'unlabelled']
+CLASS_NAMES = ['sky', 'building', 'pole', 'road', 'pavement',
+               'tree', 'signsymbol', 'fence', 'car',
+               'pedestrian', 'bicyclist', 'unlabelled']
 
-COLORS = [(128, 128, 128), (128, 0, 0), (192, 192, 128), (128, 64, 128), (0, 0, 192),
-          (128, 128, 0), (192, 128, 128), (64, 64, 128), (64, 0, 128),
-          (64, 64, 0), (0, 128, 192), (0, 0, 0)]
+CLASS_COLORS = [(128, 128, 128), (128, 0, 0), (192, 192, 128), (128, 64, 128), (0, 0, 192),
+                (128, 128, 0), (192, 128, 128), (64, 64, 128), (64, 0, 128),
+                (64, 64, 0), (0, 128, 192), (0, 0, 0)]
 
 
 class CamVidDataset(Dataset):
@@ -51,7 +55,7 @@ class CamVidDataset(Dataset):
         # read data
         image = fs.read_rgb_image(self.images_fps[i])
         mask = fs.read_image_as_is(self.masks_fps[i])
-        assert mask.max() < len(CLASSES)
+        assert mask.max() < len(CLASS_NAMES)
 
         # apply augmentations
         sample = self.transform(image=image, mask=mask)
@@ -129,8 +133,8 @@ class LinkNet34(nn.Module):
         self.finalrelu2 = nn.ReLU(inplace=True)
         self.finalconv3 = nn.Conv2d(32, num_classes, 2, padding=1)
 
-    # noinspection PyCallingNonCallable
     def forward(self, x):
+        x, pad = pad_image_tensor(x, 32)
         # Encoder
         x = self.firstconv(x)
         x = self.firstbn(x)
@@ -154,130 +158,51 @@ class LinkNet34(nn.Module):
         f4 = self.finalrelu2(f3)
         f5 = self.finalconv3(f4)
 
+        f5 = unpad_image_tensor(f5, pad)
         return f5
 
 
 def get_training_augmentation():
-    train_transform = [
-
-        # A.ShiftScaleRotate(scale_limit=0.5, rotate_limit=5, shift_limit=0.1, p=1, border_mode=cv2.BORDER_CONSTANT),
-        # A.PadIfNeeded(min_height=320, min_width=320, always_apply=True, border_mode=cv2.BORDER_CONSTANT),
+    return A.Compose([
         A.RandomSizedCrop(min_max_height=(300, 360), height=320, width=320, always_apply=True),
         A.HorizontalFlip(p=0.5),
 
-        A.IAAAdditiveGaussianNoise(p=0.2),
-        # A.IAAPerspective(p=0.5),
+        A.OneOf([
+            A.CLAHE(),
+            A.RandomBrightnessContrast(),
+            A.RandomGamma(),
+            A.HueSaturationValue(),
+            A.NoOp()
+        ]),
 
-        A.OneOf(
-            [
-                A.CLAHE(p=1),
-                A.RandomBrightnessContrast(p=1),
-                A.RandomGamma(p=1),
-                A.HueSaturationValue(p=1),
-                A.NoOp()
-            ],
-            p=0.9,
-        ),
+        A.OneOf([
+            A.IAASharpen(),
+            A.Blur(blur_limit=3),
+            A.MotionBlur(blur_limit=3),
+            A.NoOp()
+        ]),
 
-        A.OneOf(
-            [
-                A.IAASharpen(p=1),
-                A.Blur(blur_limit=3, p=1),
-                A.MotionBlur(blur_limit=3, p=1),
-            ],
-            p=0.9,
-        ),
+        A.OneOf([
+            A.RandomFog(),
+            A.RandomSunFlare(src_radius=100),
+            A.RandomRain(),
+            A.RandomSnow(),
+            A.NoOp()
+        ]),
 
+        A.Cutout(),
         A.Normalize(),
-    ]
-    return A.Compose(train_transform)
+    ])
 
 
 def get_validation_augmentation():
-    """Add paddings to make image shape divisible by 32"""
-    test_transform = [
-        A.PadIfNeeded(384, 480),
-        A.Normalize(),
-    ]
-    return A.Compose(test_transform)
-
-
-def visualize_predictions(input: dict, output: dict, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
-    images = []
-    for image, target, image_id, logits in zip(input['features'], input['targets'], input['image_id'], output['logits']):
-        image = rgb_image_from_tensor(image, mean, std)
-        # target = to_numpy(target).squeeze(0)
-        logits = to_numpy(logits).argmax(axis=0)
-
-        overlay = image.copy()
-        for class_index, class_color in enumerate(range(len(COLORS))):
-            image[logits == class_index, :] = class_color
-
-        overlay = cv2.addWeighted(image, 0.5, overlay, 0.5, 0, dtype=cv2.CV_8U)
-        cv2.putText(overlay, str(image_id), (10, 15), cv2.FONT_HERSHEY_PLAIN, 1, (250, 250, 250))
-
-        images.append(overlay)
-    return images
-
-
-class MulticlassIoUCallback(Callback):
-    """
-    Jaccard metric callback which is computed across whole epoch, not per-batch.
-    """
-
-    def __init__(self, input_key: str = "targets", output_key: str = "logits", prefix: str = "iou"):
-        """
-        :param input_key: input key to use for IoU calculation; specifies our `y_true`.
-        :param output_key: output key to use for IoU calculation; specifies our `y_pred`.
-        """
-        self.prefix = prefix
-        self.output_key = output_key
-        self.input_key = input_key
-        self.eps = 1e-7
-
-    def on_batch_end(self, state: RunnerState):
-        outputs = state.output[self.output_key].detach()
-        targets = state.input[self.input_key].detach()
-
-        dtype = outputs.dtype
-        batch_size = int(outputs.size(0))
-        num_classes = int(outputs.size(1))
-
-        # Binarize outputs as we don't want to compute soft-jaccard
-        outputs = outputs.argmax(dim=1)
-
-        outputs = outputs.cpu()
-        targets = targets.cpu()
-
-        ious_per_batch = []
-
-        for batch_index in range(batch_size):
-
-            ious_per_class = []
-            for class_index in range(num_classes):
-                pred_class_mask = (outputs[batch_index] == class_index).float()
-                true_class_mask = (targets[batch_index] == class_index).float()
-
-                intersection = float(torch.sum(true_class_mask * pred_class_mask))
-                union = float(torch.sum(true_class_mask) + torch.sum(pred_class_mask))
-                true_counts = int(torch.sum(true_class_mask) > 0)
-
-                if true_counts:
-                    iou = intersection / (union - intersection + self.eps)
-                    ious_per_class.append(iou)
-
-            if len(ious_per_class):
-                iou_per_image = np.mean(ious_per_class)
-            else:
-                iou_per_image = 0
-
-            ious_per_batch.append(iou_per_image)
-
-        metric = np.mean(ious_per_batch)
-        state.metrics.add_batch_value(name=self.prefix, value=metric)
+    return A.Compose([
+        A.Normalize()
+    ])
 
 
 def main():
+    set_trainable()
     DATA_DIR = os.path.join(os.path.dirname(__file__), 'CamVid')
 
     x_train_dir = os.path.join(DATA_DIR, 'train')
@@ -289,29 +214,70 @@ def main():
     train_ds = CamVidDataset(x_train_dir, y_train_dir, transform=get_training_augmentation())
     valid_ds = CamVidDataset(x_valid_dir, y_valid_dir, transform=get_validation_augmentation())
 
-    data_loaders = OrderedDict()
-    data_loaders['train'] = DataLoader(train_ds, batch_size=4, shuffle=True, num_workers=8, pin_memory=True)
-    data_loaders['valid'] = DataLoader(valid_ds, batch_size=4, shuffle=False, num_workers=4, pin_memory=True)
+    mul_factor = 10
 
-    num_classes = len(CLASSES)
+    data_loaders = OrderedDict()
+    data_loaders['train'] = DataLoader(train_ds, batch_size=4, num_workers=4, pin_memory=True, drop_last=True,
+                                       sampler=WeightedRandomSampler(np.ones(len(train_ds)), len(train_ds) * mul_factor))
+    data_loaders['valid'] = DataLoader(valid_ds, batch_size=4, num_workers=0, pin_memory=True, drop_last=False)
+
+    num_classes = len(CLASS_NAMES)
     model = LinkNet34(num_classes).cuda()
+
+    num_epochs = 50
+    parameters = model.parameters()
+    # parameters = get_lr_decay_parameters(model.named_parameters(),
+    #                                      1e-4,
+    #                                      {
+    #                                          "firstconv": 0.1,
+    #                                          "firstbn": 0.1,
+    #                                          "encoder1": 0.1,
+    #                                          "encoder2": 0.2,
+    #                                          "encoder3": 0.3,
+    #                                          "encoder4": 0.4,
+    #                                      })
+    # print(parameters)
+
+    adam = Adam(parameters, lr=1e-4)
+    # one_cycle = OneCycleLR(adam,
+    #                        init_lr=1e-6,
+    #                        lr_range=(1e-2, 1e-5),
+    #                        num_steps=num_epochs)
+    multistep = MultiStepLR(adam, [10, 20, 30, 40], gamma=0.5)
 
     # model runner
     runner = SupervisedRunner()
 
     # model training
+    visualize_predictions = partial(draw_semantic_segmentation_predictions,
+                                    mode='side-by-side',
+                                    class_colors=CLASS_COLORS)
+
+    current_time = datetime.now().strftime('%b%d_%H_%M')
+    prefix = f'{current_time}_linknet34'
+
+    log_dir = os.path.join('runs', prefix)
+    os.makedirs(log_dir, exist_ok=False)
+
     runner.train(
         model=model,
-        criterion=nn.CrossEntropyLoss(),
-        optimizer=Adam(model.parameters(), lr=1e-4),
+        criterion=JointLoss(nn.CrossEntropyLoss(), MulticlassDiceLoss(classes=np.arange(11)), second=0.5),
+        optimizer=adam,
         callbacks=[
-            MulticlassIoUCallback(prefix='iou'),
-            ShowPolarBatchesCallback(visualize_predictions, metric='loss', minimize=True),
+            JaccardScoreCallback(mode='multiclass',
+                                 # We exclude 'unlabeled' class from the evaluation
+                                 class_names=CLASS_NAMES[:11],
+                                 classes_of_interest=np.arange(11),
+                                 prefix='iou'),
+            ShowPolarBatchesCallback(visualize_predictions,
+                                     metric='iou',
+                                     minimize=True),
         ],
-        logdir='runs',
+        logdir=log_dir,
         loaders=data_loaders,
-        num_epochs=50,
-        verbose=False,
+        num_epochs=num_epochs,
+        scheduler=multistep,
+        verbose=True,
         main_metric='iou',
         minimize_metric=False
     )
