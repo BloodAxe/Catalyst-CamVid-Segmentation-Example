@@ -1,8 +1,9 @@
-from pytorch_toolbelt.inference.functional import unpad_image_tensor, \
-    pad_image_tensor
+from pytorch_toolbelt.inference.functional import unpad_image_tensor, pad_image_tensor
 from torch import nn
 
 from torchvision.models import resnet152, resnet34
+
+__all__ = ["LinkNet34", "LinkNet152"]
 
 
 class DecoderBlockLinkNet(nn.Module):
@@ -16,10 +17,9 @@ class DecoderBlockLinkNet(nn.Module):
         self.norm1 = nn.BatchNorm2d(in_channels // 4)
 
         # B, C/4, H, W -> B, C/4, 2 * H, 2 * W
-        self.deconv2 = nn.ConvTranspose2d(in_channels // 4, in_channels // 4,
-                                          kernel_size=4,
-                                          stride=2, padding=1,
-                                          output_padding=0)
+        self.deconv2 = nn.ConvTranspose2d(
+            in_channels // 4, in_channels // 4, kernel_size=4, stride=2, padding=1, output_padding=0
+        )
         self.norm2 = nn.BatchNorm2d(in_channels // 4)
 
         # B, C/4, H, W -> B, C, H, W

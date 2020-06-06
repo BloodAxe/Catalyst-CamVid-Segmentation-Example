@@ -5,6 +5,8 @@ from pytorch_toolbelt.modules.fpn import *
 from torch import nn
 from torch.nn import functional as F
 
+__all__ = ["resnet34_fpn", "resnet101_fpn", "resnext50_fpn"]
+
 
 class DoubleConvRelu(nn.Module):
     def __init__(self, in_dec_filters: int, out_filters: int):
@@ -44,11 +46,13 @@ class FPNSegmentationModel(nn.Module):
     def __init__(self, encoder: E.EncoderModule, num_classes: int, fpn_features=128, dropout=0.25):
         super().__init__()
 
-        decoder = D.FPNDecoder(features=encoder.output_filters,
-                               prediction_block=DoubleConvBNRelu,
-                               bottleneck=FPNBottleneckBlockBN,
-                               fpn_features=fpn_features,
-                               prediction_features=fpn_features)
+        decoder = D.FPNDecoder(
+            features=encoder.output_filters,
+            prediction_block=DoubleConvBNRelu,
+            bottleneck=FPNBottleneckBlockBN,
+            fpn_features=fpn_features,
+            prediction_features=fpn_features,
+        )
 
         self.encoder = encoder
         self.decoder = decoder
@@ -72,7 +76,7 @@ class FPNSegmentationModel(nn.Module):
         features = self.final_decoder(features)
 
         logits = self.logits(features)
-        logits = F.interpolate(logits, size=(x.size(2), x.size(3)), mode='bilinear', align_corners=True)
+        logits = F.interpolate(logits, size=(x.size(2), x.size(3)), mode="bilinear", align_corners=True)
 
         logits = unpad_image_tensor(logits, pad)
         return logits
